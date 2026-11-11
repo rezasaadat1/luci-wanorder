@@ -1,0 +1,7 @@
+{
+	"luci-app-wanorder": {
+		"description": "Manage WAN order and failover watchdog",
+		"read":  { "file": { "/usr/bin/wan-order": [ "exec" ] } },
+		"write": { "file": { "/usr/bin/wan-order": [ "exec" ] } }
+	}
+}

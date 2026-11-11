@@ -1,0 +1,142 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Shell syntax check
+        run: |
+          for f in \
+            luci-app-wanorder/root/usr/bin/wan-order \
+            luci-app-wanorder/root/usr/bin/wan-watchdog \
+            luci-app-wanorder/root/etc/init.d/wan-watchdog \
+            packaging/apk/post-install \
+            packaging/apk/pre-deinstall \
+            scripts/*.sh; do
+            echo "sh -n $f"
+            sh -n "$f"
+          done
+
+      - name: ShellCheck (errors only)
+        run: |
+          shellcheck -s sh -S error \
+            luci-app-wanorder/root/usr/bin/wan-order \
+            luci-app-wanorder/root/usr/bin/wan-watchdog \
+            packaging/apk/post-install \
+            packaging/apk/pre-deinstall \
+            scripts/*.sh
+
+      - name: JSON check (menu and ACL)
+        run: |
+          for f in luci-app-wanorder/root/usr/share/luci/menu.d/*.json \
+                   luci-app-wanorder/root/usr/share/rpcd/acl.d/*.json; do
+            echo "jq $f"
+            jq empty "$f"
+          done
+
+      - name: JavaScript syntax check (LuCI page)
+        run: node --check luci-app-wanorder/htdocs/luci-static/resources/view/wanorder.js
+
+  package:
+    name: Build packages
+    needs: lint
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read package version
+        id: ver
+        run: |
+          VER=$(sed -n 's/^PKG_VERSION:=//p' luci-app-wanorder/Makefile)
+          REL=$(sed -n 's/^PKG_RELEASE:=//p' luci-app-wanorder/Makefile)
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "release=$REL" >> "$GITHUB_OUTPUT"
+          echo "Package version: $VER-$REL"
+
+      - name: Check tag matches package version
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TAG: ${{ github.ref_name }}
+          VER: ${{ steps.ver.outputs.version }}
+        run: |
+          if [ "$TAG" != "v$VER" ]; then
+            echo "::error::Tag $TAG does not match PKG_VERSION $VER in luci-app-wanorder/Makefile"
+            exit 1
+          fi
+
+      - name: Build .apk (OpenWrt 25.12 and newer)
+        run: sh scripts/build-apk.sh
+
+      - name: Build .ipk (OpenWrt 24.10 and older)
+        run: sh scripts/build-ipk.sh
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          ls -l
+          cat SHA256SUMS
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-app-wanorder-packages
+          path: dist/*
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          name: luci-app-wanorder-packages
+          path: dist
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            **OpenWrt 25.12 and newer (apk):**
+            ```sh
+            apk add --allow-untrusted /tmp/luci-app-wanorder-*.apk
+            ```
+
+            **OpenWrt 24.10 and older (opkg):**
+            ```sh
+            opkg install /tmp/luci-app-wanorder_*_all.ipk
+            ```
+
+            Copy the file to the router first (`scp -O file root@192.168.1.1:/tmp/`),
+            then log out of LuCI and back in. The page is under **Network → WAN Order**.
+            Verify downloads with `SHA256SUMS`.

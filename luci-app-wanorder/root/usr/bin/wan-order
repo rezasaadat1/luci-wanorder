@@ -1,0 +1,288 @@
+#!/bin/sh
+# wan-order: manage WAN priority through interface metrics, and the failover watchdog
+CONF=wanorder.main
+BASE=10
+STEP=10
+PIDF=/tmp/wan-order.pid
+
+RESTART_PSW2=$(uci -q get wanorder.main.restart_passwall2)
+[ -z "$RESTART_PSW2" ] && RESTART_PSW2=1
+
+# build the interface list from the firewall wan zone on first use
+seed() {
+	[ -n "$(uci -q get $CONF.ifaces)" ] && return 0
+	[ -f /etc/config/wanorder ] || touch /etc/config/wanorder
+	[ "$(uci -q get $CONF)" = "wanorder" ] || uci set $CONF=wanorder
+	Z=$(uci show firewall 2>/dev/null | grep "\.name='wan'" | head -1 | cut -d. -f1-2)
+	SEED=$(for n in $(uci -q get $Z.network); do
+		p=$(uci -q get network.$n.proto)
+		case "$p" in dhcpv6|6in4|6to4|6rd|wireguard|none|"") continue ;; esac
+		m=$(uci -q get network.$n.metric); [ -z "$m" ] && m=999
+		echo "$m $n"
+	done | sort -n | awk '{print $2}')
+	[ -z "$SEED" ] && SEED="wan"
+	for n in $SEED; do
+		uci add_list $CONF.ifaces="$n"
+		uci add_list $CONF.default="$n"
+	done
+	uci commit wanorder
+}
+
+seed
+IFACES=$(uci -q get $CONF.ifaces)
+DEFAULT=$(uci -q get $CONF.default)
+[ -z "$IFACES" ] && IFACES="wan"
+
+kill_timer() {
+	if [ -f "$PIDF" ]; then
+		OLD=$(cat "$PIDF")
+		[ "$OLD" != "$$" ] && kill "$OLD" 2>/dev/null
+		rm -f "$PIDF"
+	fi
+}
+
+# one line per interface: name dev up metric auto ip active  (the page sorts by metric)
+status() {
+	ACTIVE=$(ip -4 route show default 2>/dev/null | awk '{m=0; d=""; for(i=1;i<=NF;i++){ if($i=="metric") m=$(i+1); if($i=="dev") d=$(i+1)} print m, d}' | sort -n | head -n 1 | cut -d' ' -f2)
+	for i in $IFACES; do
+		m=$(uci -q get network.$i.metric); [ -z "$m" ] && m=999
+		a=$(uci -q get network.$i.auto);   [ -z "$a" ] && a=1
+		js=$(ifstatus $i 2>/dev/null)
+		up=$(echo "$js" | jsonfilter -e '@.up' 2>/dev/null); [ -z "$up" ] && up=false
+		dev=$(echo "$js" | jsonfilter -e '@.l3_device' 2>/dev/null)
+		ip=$(echo "$js" | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)
+		act=no
+		[ -n "$dev" ] && [ "$dev" = "$ACTIVE" ] && act=yes
+		[ -z "$dev" ] && dev=-
+		[ -z "$ip" ] && ip=-
+		echo "$i $dev $up $m $a $ip $act"
+	done
+}
+
+# managed interfaces sorted by current metric
+ordered() {
+	for i in $IFACES; do
+		m=$(uci -q get network.$i.metric); [ -z "$m" ] && m=999
+		echo "$m $i"
+	done | sort -n | awk '{print $2}' | tr '\n' ' '
+}
+
+# saved default order, cleaned against the current list
+norm_default() {
+	out=""
+	for d in $DEFAULT; do
+		case " $IFACES " in
+			*" $d "*) case " $out " in *" $d "*) ;; *) out="$out $d" ;; esac ;;
+		esac
+	done
+	for i in $IFACES; do
+		case " $out " in *" $i "*) ;; *) out="$out $i" ;; esac
+	done
+	echo $out
+}
+
+net_exists() { [ "$(uci -q get network.$1)" = "interface" ]; }
+
+# networks that belong to a firewall zone other than wan
+non_wan_nets() {
+	i=0
+	while uci -q get firewall.@zone[$i] >/dev/null 2>&1; do
+		n=$(uci -q get firewall.@zone[$i].name)
+		[ "$n" != "wan" ] && uci -q get firewall.@zone[$i].network
+		i=$((i+1))
+	done
+}
+
+ensure_wan_zone() {
+	Z=$(uci show firewall | grep "\.name='wan'" | head -1 | cut -d. -f1-2)
+	if [ -z "$Z" ]; then echo "WARNING: wan firewall zone not found"; return; fi
+	for n in $(uci -q get $Z.network); do [ "$n" = "$1" ] && return; done
+	uci add_list $Z.network="$1"
+	uci commit firewall
+	/etc/init.d/firewall reload >/dev/null 2>&1
+	echo "Added $1 to the wan firewall zone"
+}
+
+# interfaces that could be added: name proto
+candidates() {
+	EXC=" loopback lan $(non_wan_nets | tr '\n' ' ') $IFACES "
+	uci show network 2>/dev/null | sed -n 's/^network\.\([^.=]*\)=interface$/\1/p' | while read n; do
+		case "$EXC" in *" $n "*) continue ;; esac
+		p=$(uci -q get network.$n.proto); [ -z "$p" ] && p=unmanaged
+		case "$p" in dhcpv6|6in4|6to4|6rd|wireguard|none) continue ;; esac
+		echo "$n $p"
+	done
+}
+
+valid_order() {
+	cnt=0
+	for i in "$@"; do
+		case " $IFACES " in *" $i "*) ;; *) echo "unknown interface: $i"; return 1 ;; esac
+		cnt=$((cnt+1))
+	done
+	total=$(echo $IFACES | wc -w)
+	[ "$cnt" -eq "$total" ] || { echo "give all interfaces: $IFACES"; return 1; }
+	dup=$(for i in "$@"; do echo "$i"; done | sort | uniq -d)
+	[ -z "$dup" ] || { echo "duplicate interface: $dup"; return 1; }
+	return 0
+}
+
+post_actions() {
+	(
+		sleep 3
+		command -v conntrack >/dev/null 2>&1 && conntrack -F >/dev/null 2>&1
+		[ "$RESTART_PSW2" = "1" ] && [ -x /etc/init.d/passwall2 ] && /etc/init.d/passwall2 restart
+	) >/dev/null 2>&1 &
+}
+
+apply_order() {
+	n=$BASE
+	for i in "$@"; do
+		uci set network.$i.metric="$n"
+		n=$((n+STEP))
+	done
+	uci commit network
+	/etc/init.d/network reload
+	sleep 5
+	post_actions
+}
+
+enabled_count() {
+	c=0
+	for i in $IFACES; do
+		[ "$(uci -q get network.$i.auto)" = "0" ] || c=$((c+1))
+	done
+	echo $c
+}
+
+known() {
+	case " $IFACES " in *" $1 "*) return 0 ;; esac
+	echo "unknown interface: $1"
+	return 1
+}
+
+# ---- watchdog control: wan-order watchdog status|enable|disable ----
+watchdog_cmd() {
+	case "$1" in
+		status)
+			en=$(uci -q get wanorder.watchdog.enabled)
+			[ "$en" = "0" ] && en=disabled || en=enabled
+			r=$(ubus call service list '{"name":"wan-watchdog"}' 2>/dev/null | jsonfilter -e '@["wan-watchdog"].instances.instance1.running' 2>/dev/null)
+			[ "$r" = "true" ] && r=running || r=stopped
+			ds=$(uci -q get wanorder.watchdog.down_secs); [ -z "$ds" ] && ds=300
+			echo "$en $r $ds" ;;
+		enable)
+			[ -f /etc/config/wanorder ] || touch /etc/config/wanorder
+			uci -q get wanorder.watchdog >/dev/null || uci set wanorder.watchdog=watchdog
+			uci set wanorder.watchdog.enabled=1
+			uci commit wanorder
+			/etc/init.d/wan-watchdog enable
+			/etc/init.d/wan-watchdog restart
+			echo "Watchdog enabled" ;;
+		disable)
+			[ -f /etc/config/wanorder ] || touch /etc/config/wanorder
+			uci -q get wanorder.watchdog >/dev/null || uci set wanorder.watchdog=watchdog
+			uci set wanorder.watchdog.enabled=0
+			uci commit wanorder
+			/etc/init.d/wan-watchdog stop
+			/etc/init.d/wan-watchdog disable
+			echo "Watchdog disabled" ;;
+		*)
+			echo "usage: wan-order watchdog status | enable | disable"; return 1 ;;
+	esac
+}
+
+case "$1" in
+	seed)
+		echo "Managed interfaces: $IFACES" ;;
+	postinstall)
+		chmod +x /usr/bin/wan-order /usr/bin/wan-watchdog /etc/init.d/wan-watchdog 2>/dev/null
+		if [ "$(uci -q get wanorder.watchdog.enabled)" != "0" ]; then
+			/etc/init.d/wan-watchdog enable
+			/etc/init.d/wan-watchdog restart
+		fi
+		rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache
+		/etc/init.d/rpcd reload >/dev/null 2>&1
+		echo "ok" ;;
+	watchdog)
+		watchdog_cmd "$2" ;;
+	status)
+		status ;;
+	candidates)
+		candidates ;;
+	set)
+		shift
+		kill_timer
+		REV=""
+		if [ "$1" = "--revert" ]; then REV="$2"; shift 2; fi
+		valid_order "$@" || exit 1
+		apply_order "$@"
+		echo "Order: $*"
+		if [ -n "$REV" ] && [ "$REV" -gt 0 ] 2>/dev/null; then
+			setsid sh -c "echo \$\$ > $PIDF; sleep $((REV * 60)); exec /usr/bin/wan-order default" </dev/null >/dev/null 2>&1 &
+			echo "Reverts to default order in $REV minutes"
+		fi ;;
+	default)
+		kill_timer
+		D=$(norm_default)
+		apply_order $D
+		echo "Order: $D" ;;
+	savedefault)
+		CUR=$(ordered)
+		uci -q delete $CONF.default
+		for i in $CUR; do uci add_list $CONF.default="$i"; done
+		uci commit wanorder
+		echo "Default order saved: $CUR" ;;
+	add)
+		N="$2"
+		[ -n "$N" ] || { echo "usage: wan-order add <interface>"; exit 1; }
+		net_exists "$N" || { echo "interface '$N' not found in /etc/config/network"; exit 1; }
+		case " $IFACES " in *" $N "*) echo "$N is already in the list"; exit 1 ;; esac
+		case " $(non_wan_nets | tr '\n' ' ') " in *" $N "*) echo "$N belongs to a non-WAN firewall zone"; exit 1 ;; esac
+		ensure_wan_zone "$N"
+		CUR=$(ordered)
+		uci add_list $CONF.ifaces="$N"
+		uci add_list $CONF.default="$N"
+		uci commit wanorder
+		apply_order $CUR $N
+		echo "Added $N (order: $CUR $N)" ;;
+	remove)
+		N="$2"
+		known "$N" || exit 1
+		[ "$(echo $IFACES | wc -w)" -gt 1 ] || { echo "Refusing to remove the last interface"; exit 1; }
+		uci del_list $CONF.ifaces="$N"
+		uci del_list $CONF.default="$N"
+		uci commit wanorder
+		IFACES=$(uci -q get $CONF.ifaces)
+		uci set network.$N.metric=900
+		if [ "$3" = "down" ]; then
+			uci set network.$N.auto=0
+			uci commit network
+			ifdown "$N"
+		fi
+		apply_order $(ordered)
+		echo "Removed $N" ;;
+	enable)
+		known "$2" || exit 1
+		uci set network.$2.auto=1
+		uci commit network
+		ifup "$2"
+		sleep 3
+		post_actions
+		echo "Enabled $2" ;;
+	disable)
+		known "$2" || exit 1
+		if [ "$(uci -q get network.$2.auto)" != "0" ] && [ "$(enabled_count)" -le 1 ]; then
+			echo "Refusing to disable the last enabled interface"
+			exit 1
+		fi
+		uci set network.$2.auto=0
+		uci commit network
+		ifdown "$2"
+		sleep 3
+		post_actions
+		echo "Disabled $2" ;;
+	*)
+		echo "usage: wan-order status | candidates | seed | set [--revert MIN] <if...> | default | savedefault | add <if> | remove <if> [down] | enable <if> | disable <if> | watchdog status|enable|disable"
+		exit 1 ;;
+esac

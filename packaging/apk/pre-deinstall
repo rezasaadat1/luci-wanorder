@@ -1,0 +1,4 @@
+#!/bin/sh
+/etc/init.d/wan-watchdog stop 2>/dev/null
+/etc/init.d/wan-watchdog disable 2>/dev/null
+exit 0

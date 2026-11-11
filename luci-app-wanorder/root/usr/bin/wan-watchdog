@@ -1,0 +1,86 @@
+#!/bin/sh
+# wan-watchdog: promote the next WAN if the primary has no internet for DOWN_SECS
+cfg() { uci -q get wanorder.watchdog.$1; }
+INTERVAL=$(cfg interval);   [ -z "$INTERVAL" ] && INTERVAL=10
+DOWN_SECS=$(cfg down_secs); [ -z "$DOWN_SECS" ] && DOWN_SECS=300
+TARGETS=$(cfg target);      [ -z "$TARGETS" ] && TARGETS="1.1.1.1 8.8.8.8"
+
+log() { logger -t wan-watchdog "$*"; }
+
+now() { read up rest < /proc/uptime; echo "${up%.*}"; }
+
+healthy() {
+	dev="$1"
+	if [ -z "$dev" ] || [ "$dev" = "-" ]; then return 1; fi
+	for t in $TARGETS; do
+		ping -c 1 -W 2 -I "$dev" "$t" >/dev/null 2>&1 && return 0
+	done
+	return 1
+}
+
+failover() {
+	CAND=""
+	echo "$LIST" | tail -n +2 > /tmp/wan-watchdog.cands
+	while read m n d; do
+		if healthy "$d"; then CAND="$n"; break; fi
+	done < /tmp/wan-watchdog.cands
+	rm -f /tmp/wan-watchdog.cands
+
+	if [ -z "$CAND" ]; then
+		log "no healthy backup interface, staying on $PRIM (retry in 60s)"
+		down_since=$(( $(now) - DOWN_SECS + 60 ))
+		return
+	fi
+
+	FULL=$(/usr/bin/wan-order status | awk '{print $4, $1}' | sort -n | awk '{print $2}')
+	NEW="$CAND"
+	for n in $FULL; do
+		[ "$n" = "$CAND" ] && continue
+		[ "$n" = "$PRIM" ] && continue
+		NEW="$NEW $n"
+	done
+	NEW="$NEW $PRIM"
+
+	log "FAILOVER: $PRIM -> $CAND (new order: $NEW)"
+	/usr/bin/wan-order set $NEW
+	down_since=""
+	last=""
+	sleep 20
+}
+
+down_since=""
+last=""
+log "started (check every ${INTERVAL}s, failover after ${DOWN_SECS}s, targets: $TARGETS)"
+
+while true; do
+	LIST=$(/usr/bin/wan-order status 2>/dev/null | awk '$5 != "0" {print $4, $1, $2}' | sort -n)
+	COUNT=$(echo "$LIST" | grep -c .)
+
+	if [ "$COUNT" -ge 2 ]; then
+		set -- $(echo "$LIST" | head -n 1)
+		PRIM="$2"
+		PDEV="$3"
+
+		if [ "$PRIM" != "$last" ]; then
+			last="$PRIM"
+			down_since=""
+			log "monitoring primary: $PRIM ($PDEV)"
+		fi
+
+		if healthy "$PDEV"; then
+			if [ -n "$down_since" ]; then log "$PRIM recovered"; fi
+			down_since=""
+		else
+			t=$(now)
+			if [ -z "$down_since" ]; then
+				down_since="$t"
+				log "$PRIM has no internet, waiting ${DOWN_SECS}s before failover"
+			fi
+			if [ $((t - down_since)) -ge "$DOWN_SECS" ]; then
+				failover
+			fi
+		fi
+	fi
+
+	sleep "$INTERVAL"
+done

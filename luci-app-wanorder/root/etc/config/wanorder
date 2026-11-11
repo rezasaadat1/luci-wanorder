@@ -1,0 +1,9 @@
+config wanorder 'main'
+	option restart_passwall2 '1'
+
+config watchdog 'watchdog'
+	option enabled '1'
+	option interval '10'
+	option down_secs '300'
+	list target '1.1.1.1'
+	list target '8.8.8.8'
